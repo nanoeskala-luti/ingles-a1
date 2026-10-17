@@ -1205,6 +1205,30 @@ a{color:var(--navy)}
     return out;
   }
 
+  /* ---------- Sesión de audio (iPhone) ----------
+     En iPhone, la voz de las páginas se calla con el modo silencio y, después de usar el micrófono,
+     puede quedarse sin salida. 'playback' (iOS 17+) la manda a la bocina aunque esté en silencio;
+     antes de escuchar se regresa a 'auto' para que el micrófono funcione igual que siempre. */
+  const NAV = typeof navigator !== 'undefined' ? navigator : {};
+  const AS = NAV.audioSession || null;
+  const IOS = /iP(hone|ad|od)/.test(NAV.userAgent || '') || (NAV.platform === 'MacIntel' && NAV.maxTouchPoints > 1);
+  function audioSession(type) { try { if (AS && AS.type !== type) AS.type = type; } catch (e) {} }
+  let silentUrl = null;
+  function primeMedia() {
+    // iOS viejo (sin navigator.audioSession): un audio mudo pasa la página al canal de "medios", que ignora el modo silencio
+    try {
+      if (!silentUrl) {
+        const n = 800, buf = new ArrayBuffer(44 + n), d = new DataView(buf);
+        const w = (o, s) => { for (let i = 0; i < s.length; i++) d.setUint8(o + i, s.charCodeAt(i)); };
+        w(0, 'RIFF'); d.setUint32(4, 36 + n, true); w(8, 'WAVE'); w(12, 'fmt '); d.setUint32(16, 16, true); d.setUint16(20, 1, true); d.setUint16(22, 1, true);
+        d.setUint32(24, 8000, true); d.setUint32(28, 8000, true); d.setUint16(32, 1, true); d.setUint16(34, 8, true); w(36, 'data'); d.setUint32(40, n, true);
+        for (let i = 0; i < n; i++) d.setUint8(44 + i, 128);
+        silentUrl = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+      }
+      const a = new Audio(silentUrl); a.setAttribute('playsinline', ''); const p = a.play(); if (p && p.catch) p.catch(() => {});
+    } catch (e) {}
+  }
+
   /* ---------- Reconocimiento de voz ---------- */
   const SR = typeof window !== 'undefined' ? (window.SpeechRecognition || window.webkitSpeechRecognition) : null;
   const Mic = {
@@ -1241,7 +1265,7 @@ a{color:var(--navy)}
         rec.continuous = false;
         const finals = []; let done = false; let lastInterim = '';
         const finish = extra => {
-          if (done) return; done = true; clearTimeout(timer); Mic.current = null;
+          if (done) return; done = true; clearTimeout(timer); Mic.current = null; Mic.lastEnd = Date.now();
           let alts = [];
           if (finals.length === 1) alts = finals[0];
           else if (finals.length > 1) alts = [{ t: finals.map(f => f[0].t).join(' '), c: 1 }].concat(finals[0].slice(1).map(a => ({ t: a.t + ' ' + finals.slice(1).map(f => f[0].t).join(' '), c: a.c })));
@@ -1265,6 +1289,7 @@ a{color:var(--navy)}
         rec.onend = () => finish({});
         rec.onstart = () => { if (Mic.state !== 'blocked') Mic.state = 'ok'; };
         const timer = setTimeout(() => { try { rec.stop(); } catch (e) {} }, 12000);
+        audioSession('auto');
         try { rec.start(); Mic.current = rec; } catch (e) { finish({ error: 'start-failed' }); }
       });
     },
@@ -1274,49 +1299,114 @@ a{color:var(--navy)}
 
   /* ---------- Síntesis de voz ---------- */
   const synth = typeof window !== 'undefined' ? window.speechSynthesis : null;
+  // voces "de juguete" de iPhone/Mac (suenan raro o no suenan): nunca se eligen solas ni aparecen en la lista
+  const NOVELTY = /\b(Albert|Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Good News|Jester|Organ|Superstar|Trinoids|Whisper|Wobble|Zarvox|Eddy|Flo|Grandma|Grandpa|Reed|Rocko|Sandy|Shelley|Fred|Junior|Ralph|Kathy|Princess|Deranged|Hysterical)\b/i;
+  const wait = ms => new Promise(r => setTimeout(r, ms));
   const Voice = {
-    available: !!synth,
-    voices: [], en: null, en2: null, es: null, preferredEn: '',
+    available: !!synth, ios: IOS,
+    voices: [], en: null, en2: null, es: null, hasEs: false, preferredEn: '',
+    bad: new Set(),
     load() {
       if (!synth) return;
-      const vs = synth.getVoices() || [];
-      if (!vs.length) return;
+      const all = synth.getVoices() || [];
+      if (!all.length) return;
+      const vs = all.filter(v => !NOVELTY.test(v.name) && !this.bad.has(v.name));
       this.voices = vs;
       const score = (v, prefs) => { let s = 0; prefs.forEach((p, i) => { if (p.test(v.name)) s = Math.max(s, 100 - i * 5); }); if (v.localService === false) s += 3; return s; };
+      const best = (list, prefs, min) => { const r = list.map(v => [score(v, prefs), v]).sort((a, b) => b[0] - a[0])[0]; return r && r[0] >= min ? r[1] : null; };
       const enPrefs = [/Google US English/i, /Samantha/i, /Aria.*Natural|Jenny.*Natural|Ava.*Natural|Emma.*Natural/i, /Microsoft (Aria|Jenny|Ava|Emma)/i, /Allison|Ava|Susan|Karen/i, /Zira/i, /English.*(United States|US)/i];
       const enAll = vs.filter(v => /^en[-_]US/i.test(v.lang)).concat(vs.filter(v => /^en/i.test(v.lang) && !/^en[-_]US/i.test(v.lang)));
       const chosen = this.preferredEn && vs.find(v => v.name === this.preferredEn);
-      this.en = chosen || enAll.slice().sort((a, b) => score(b, enPrefs) - score(a, enPrefs))[0] || null;
-      const malePrefs = [/Google UK English Male/i, /Daniel|Alex|Fred|Aaron|Arthur|Guy|Davis|David|Mark|Tom|Rishi|Oliver/i, /Male/i];
-      this.en2 = enAll.filter(v => v !== this.en).sort((a, b) => score(b, malePrefs) - score(a, malePrefs))[0] || null;
+      // si ninguna voz conocida aparece, se deja la voz del sistema (null + lang en-US): es la más segura
+      this.en = chosen || best(enAll, enPrefs, 5);
+      const malePrefs = [/Google UK English Male/i, /Daniel|Alex|Aaron|Arthur|Guy|Davis|David|Mark|Tom|Rishi|Oliver/i, /Male/i];
+      this.en2 = best(enAll.filter(v => v !== this.en), malePrefs, 5);
       const esPrefs = [/Paulina|Sabina|Dalia|Jorge|Juan|Raul|Mónica|Monica/i, /Google español de Estados Unidos/i, /Google español/i];
       const esAll = vs.filter(v => /^es[-_](MX|US|419)/i.test(v.lang)).concat(vs.filter(v => /^es/i.test(v.lang) && !/^es[-_](MX|US|419)/i.test(v.lang)));
-      this.es = esAll.slice().sort((a, b) => score(b, esPrefs) - score(a, esPrefs))[0] || null;
+      this.hasEs = all.some(v => /^es/i.test(v.lang));
+      this.es = best(esAll, esPrefs, 0);
     },
-    keep: [],
+    keep: [], _q: Promise.resolve(), _gen: 0, _job: null, _blankAt: 0, unlocked: false, startSeen: false, troubled: false, onTrouble: null,
+    unlock() {
+      // se llama en cada toque (fase de captura): la primera vez "despierta" la voz dentro del gesto, como exige el iPhone
+      if (!synth || this.unlocked) return;
+      this.unlocked = true;
+      audioSession('playback');
+      try {
+        if ((synth.speaking || synth.pending) && !this._job) synth.cancel();
+        const u = new SpeechSynthesisUtterance(' ');
+        u.volume = 0; u.lang = 'en-US';
+        this.keep.push(u); this._blankAt = Date.now();
+        synth.speak(u);
+      } catch (e) {}
+      if (IOS && !AS) primeMedia();
+    },
+    trouble() { if (this.troubled) return; this.troubled = true; try { this.onTrouble && this.onTrouble(); } catch (e) {} },
     speakOne(text, opt) {
       opt = opt || {};
+      if (!synth || !text) return Promise.resolve();
+      if (opt.lang === 'es' && !this.hasEs) return Promise.resolve();
+      const gen = this._gen;
+      const run = async () => {
+        if (gen !== this._gen) return;
+        const gap = IOS ? 450 - (Date.now() - (Mic.lastEnd || 0)) : 0;   // dejar que el iPhone suelte el micrófono
+        if (gap > 0) await wait(gap);
+        await this._speakNow(text, opt, gen);
+      };
+      const p = this._q.then(run, run);   // una frase a la vez: así se sabe si de verdad empezó a sonar
+      this._q = p;
+      return p;
+    },
+    _speakNow(text, opt, gen) {
       return new Promise(resolve => {
-        if (!synth || !text) return resolve();
-        const u = new SpeechSynthesisUtterance(text);
+        if (!synth || gen !== this._gen) return resolve();
         const isEs = opt.lang === 'es';
-        const v = isEs ? this.es : (opt.voice === 2 && this.en2 ? this.en2 : this.en);
-        if (isEs && !this.es) return resolve();
-        if (v) u.voice = v;
-        u.lang = v ? v.lang : (isEs ? 'es-MX' : 'en-US');
-        u.rate = opt.rate || 1;
-        u.pitch = opt.pitch || (opt.voice === 2 && !this.en2 ? 0.85 : 1);
-        let done = false;
-        const fin = () => { if (done) return; done = true; clearTimeout(t); resolve(); };
-        u.onend = fin; u.onerror = fin;
-        const t = setTimeout(fin, 1500 + text.length * 95 / (u.rate || 1));
-        this.keep.push(u); if (this.keep.length > 20) this.keep.shift();
-        synth.speak(u);
+        audioSession('playback');
+        try { if (synth.paused) synth.resume(); } catch (e) {}
+        let done = false, started = false, tries = 0, used = null, wd = null, cu = null;
+        const job = {};
+        const fin = () => { if (done) return; done = true; clearTimeout(cap); clearTimeout(wd); if (this._job === job) this._job = null; resolve(); };
+        job.fin = fin; this._job = job;
+        const watch = IOS;   // el vigilante solo en iPhone; en Android y computadora todo sigue igual que antes
+        const retry = () => {
+          clearTimeout(wd);
+          if (used) { this.bad.add(used.name); this.load(); }   // esa voz no sirve aquí: usar la del sistema
+          if (cu) cu.onstart = cu.onend = cu.onerror = null;    // que el cancel no cierre este turno
+          try { synth.cancel(); } catch (e) {}
+          setTimeout(() => go(false), 150);
+        };
+        const go = withVoice => {
+          if (done) return;
+          if (gen !== this._gen) return fin();
+          tries++;
+          const u = cu = new SpeechSynthesisUtterance(text);
+          const v = withVoice ? (isEs ? this.es : (opt.voice === 2 && this.en2 ? this.en2 : this.en)) : null;
+          used = v;
+          if (v) u.voice = v;
+          u.lang = v ? v.lang : (isEs ? 'es-MX' : 'en-US');
+          u.rate = opt.rate || 1;
+          u.pitch = opt.pitch || (opt.voice === 2 && !this.en2 ? 0.85 : 1);
+          u.onstart = () => { started = true; this.startSeen = true; clearTimeout(wd); };
+          u.onend = fin;
+          u.onerror = e => { const er = e && e.error; if (!started && tries < 2 && er !== 'interrupted' && er !== 'canceled') retry(); else fin(); };
+          this.keep.push(u); if (this.keep.length > 20) this.keep.shift();
+          try { synth.speak(u); } catch (e) { fin(); return; }
+          if (watch) {
+            clearTimeout(wd);
+            wd = setTimeout(() => { if (started || done) return; if (tries < 2) retry(); else { this.trouble(); fin(); } }, 2500);
+          }
+        };
+        const cap = setTimeout(fin, IOS ? 6000 + text.length * 120 / (opt.rate || 1) : 1500 + text.length * 95 / (opt.rate || 1));
+        // en iPhone a veces la cola de voz se queda atorada: limpiarla antes de hablar
+        const stuck = IOS && (synth.speaking || synth.pending) && Date.now() - this._blankAt > 1000;
+        if (stuck) { try { synth.cancel(); } catch (e) {} setTimeout(() => go(true), 120); }
+        else go(true);
       });
     },
     async say(segments, opt) {
       // segments: [{t, lang:'en'|'es', voice}] o string (inglés)
       if (!synth) return;
+      if (!this.voices.length) this.load();
       if (typeof segments === 'string') segments = [{ t: segments, lang: 'en' }];
       const token = (this._token = (this._token || 0) + 1);
       for (const s of segments) {
@@ -1325,7 +1415,12 @@ a{color:var(--navy)}
         for (const p of parts) { if (token !== this._token) return; await this.speakOne(p.trim(), Object.assign({}, opt, s)); }
       }
     },
-    cancel() { this._token = (this._token || 0) + 1; try { synth && synth.cancel(); } catch (e) {} }
+    cancel() {
+      this._token = (this._token || 0) + 1;
+      this._gen++;
+      try { synth && synth.cancel(); } catch (e) {}
+      if (this._job) this._job.fin();
+    }
   };
   if (synth) { Voice.load(); try { synth.addEventListener('voiceschanged', () => Voice.load()); } catch (e) { synth.onvoiceschanged = () => Voice.load(); } }
 
@@ -2947,8 +3042,8 @@ a{color:var(--navy)}
   /* ---------- voz ---------- */
   const rate = slow => slow ? 0.62 : (S.settings.rate === 'lenta' ? 0.78 : 0.95);
   function sayEn(text, opt) { opt = opt || {}; return E.Voice.say([{ t: fill(text).replace(/\*\*/g, ''), lang: 'en', voice: opt.voice }], { rate: rate(opt.slow) }); }
-  function sayEs(text) { if (!S.settings.readEs || !E.Voice.es) return Promise.resolve(); return E.Voice.say([{ t: text, lang: 'es' }], { rate: 1.05 }); }
-  function sayMix(segs) { return E.Voice.say(segs.filter(s => s.lang !== 'es' || (S.settings.readEs && E.Voice.es)).map(s => Object.assign({}, s, { t: fill(s.t) })), { rate: rate(false) }); }
+  function sayEs(text) { if (!S.settings.readEs || !E.Voice.hasEs) return Promise.resolve(); return E.Voice.say([{ t: text, lang: 'es' }], { rate: 1.05 }); }
+  function sayMix(segs) { return E.Voice.say(segs.filter(s => s.lang !== 'es' || (S.settings.readEs && E.Voice.hasEs)).map(s => Object.assign({}, s, { t: fill(s.t) })), { rate: rate(false) }); }
   const micUsable = () => !S.settings.noMic && E.Mic.supported && E.Mic.state !== 'blocked' && E.Mic.state !== 'denied';
   const PRAISE = ['Great job!', 'Excellent!', 'Perfect!', 'Well done!', 'Awesome!', 'Nice!', 'Very good!'];
   const PRAISE_ES = ['¡Excelente!', '¡Muy bien dicho!', '¡Perfecto!', '¡Eso es!', '¡Así se dice!', '¡Muy bien!'];
@@ -3239,6 +3334,7 @@ a{color:var(--navy)}
   function startLesson(spec) {
     if (GATE && !access().valid) { render(); return; }
     E.Voice.cancel();
+    if (E.Voice.ios && !S.settings.iosTip) { S.settings.iosTip = true; save(); toast('En iPhone: si no oyes la voz, sube el volumen y quita el modo silencio.', 6500); }
     spec.back = spec.back || location.hash || '#inicio';
     L = { spec, i: 0, score: 0, max: 0, miss: [], started: Date.now(), aborted: false, resolve: null, listening: false, phrases: 0 };
     renderLessonShell();
@@ -3447,7 +3543,7 @@ a{color:var(--navy)}
       fbCard(r.near ? 'near' : 'bad', title, lines.slice(0, 3), cfg.model);
       if (cfg.model) {
         const heardShort = r.heard && r.heard.trim().split(/\s+/).length <= 8 ? r.heard.trim() : '';
-        if (r.near && heardShort && (cfg.item.mode === 'pron' || cfg.item.mode === 'exact') && S.settings.readEs && E.Voice.es) {
+        if (r.near && heardShort && (cfg.item.mode === 'pron' || cfg.item.mode === 'exact') && S.settings.readEs && E.Voice.hasEs) {
           await T(sayMix([{ t: 'Dijiste:', lang: 'es' }, { t: heardShort, lang: 'en' }, { t: 'Y se dice:', lang: 'es' }]));
         } else {
           await T(sayMix([{ t: r.near ? '¡Casi! Escucha:' : 'Escucha cómo se dice:', lang: 'es' }]));
@@ -3963,6 +4059,10 @@ When the student's message is START, greet the student and ask the first questio
     buildPron();
     E.Voice.preferredEn = S.settings.voiceEn || '';
     E.Voice.load();
+    // el iPhone solo deja hablar a la página si la primera frase sale de un toque: se "despierta" la voz en el primer toque
+    const unlock = () => E.Voice.unlock();
+    ['touchend', 'click', 'keydown'].forEach(ev => document.addEventListener(ev, unlock, true));
+    E.Voice.onTrouble = () => toast('No se oye la voz. Sube el volumen y revisa que el teléfono no esté en silencio.', 7000);
     E.Mic.probe().then(st => { if (!L && S.onboarded && (st === 'blocked' || st === 'denied' || st === 'unsupported')) render(); });
     window.addEventListener('hashchange', render);
     render();
